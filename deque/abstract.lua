@@ -5,6 +5,7 @@ local session = box.session
 
 -- maximum timeout in seconds (500 years will be enough for everyone :)
 local TIMEOUT_INFINITY  = 365 * 86400 * 500
+
 -- task states
 local state = {
     DELAYED = '~',  -- task is delayed (waiting)
@@ -18,16 +19,29 @@ human_status[state.DELAYED] = 'delayed'
 human_status[state.TAKEN]   = 'taken'
 human_status[state.DONE]    = 'done'
 
+-- space schema
+local i_id         = 1  -- task ID
+local i_status     = 2  -- task status
+local i_next_event = 3  -- time of next event to be done on this task
+local i_ttl        = 4  -- time to live
+local i_created    = 5  -- creation time
+local i_data       = 6  -- task data
 
-local driver = require('deque.driver')
+
 local queue = {
     tube = {},
     stat = {},
 }
-
-
--- tube methods
 local tube = {}
+local method = {}
+
+
+-- cleanup internal fields in task
+function tube.normalize_task(self, task)
+    if task ~= nil then
+        return task:transform(3, 3)
+    end
+end
 
 -- put task in space
 function tube.put(self, data, opts)
@@ -35,9 +49,38 @@ function tube.put(self, data, opts)
         opts = {}
     end
 
-    local task = self.raw:put(data, opts)
-    return self.raw:normalize_task(task)
+    local id = 0
+    local max = self.space.index.task_id:max()
+    if max ~= nil then
+        id = max[i_id] + 1
+    end
+
+    local ttl = opts.ttl or TIMEOUT_INFINITY
+
+    local now = fiber.time()
+    local valid_until = 0ULL + (now + ttl) * 1000000
+    local status = state.READY
+    local next_event = valid_until
+
+    -- TODO: check if delay > ttl
+    if opts.delay ~= nil and opts.delay > 0 then
+        status = state.DELAYED
+        next_event = 0ULL + (now + opts.delay) * 1000000
+    end
+
+    local task = self.space:insert{
+        id,
+        status,
+        next_event,
+        valid_until,
+        now,
+        data
+    }
+    self:on_task_change(task, 'put')
+
+    return self:normalize_task(task)
 end
+
 
 -- take task
 function tube.take(self, timeout)
@@ -45,9 +88,15 @@ function tube.take(self, timeout)
         timeout = TIMEOUT_INFINITY
     end
 
-    local task = self.raw:take()
-    if task ~= nil then
-        return self.raw:normalize_task(task)
+    -- FIXME: duplicate code below
+    local task = self.space.index.status:min{state.READY}
+    if task ~= nil and task[i_status] == state.READY then
+        task = self.space:update(task[i_id], {
+            {'=', i_status, state.TAKEN},
+            {'=', i_next_event, task[i_ttl]}
+        })
+        self:on_task_change(task, 'take')
+        return self:normalize_task(task)
     end
 
     local started, time, tube_id
@@ -60,9 +109,15 @@ function tube.take(self, timeout)
         fiber.sleep(timeout)
         box.space._queue_consumers:delete{session.id(), fiber.id()}
 
-        task = self.raw:take()
-        if task ~= nil then
-            return self.raw:normalize_task(task)
+        -- FIXME: duplicate code above
+        local task = self.space.index.status:min{state.READY}
+        if task ~= nil and task[i_status] == state.READY then
+            task = self.space:update(task[i_id], {
+                {'=', i_status, state.TAKEN},
+                {'=', i_next_event, task[i_ttl]}
+            })
+            self:on_task_change(task, 'take')
+            return self:normalize_task(task)
         end
 
         timeout = timeout - (fiber.time() - started)
@@ -78,7 +133,7 @@ function tube.ack(self, id)
 
     self:peek(id)
     box.space._queue_taken:delete{session.id(), self.tube_id, id}
-    return self.raw:normalize_task(self.raw:delete(id):transform(2, 1, state.DONE))
+    return self:delete(id)
 end
 
 -- release task
@@ -94,23 +149,49 @@ function tube.release(self, id, opts)
 
     box.space._queue_taken:delete{session.id(), self.tube_id, id}
     self:peek(id)
-    return self.raw:normalize_task(self.raw:release(id, opts))
+
+    local task = self.space:get{id}
+    if task == nil then
+        return
+    end
+
+    if opts.delay ~= nil and opts.delay > 0 then
+        task = self.space:update(id, {
+            {'=', i_status, state.DELAYED},
+            {'=', i_next_event, 0ULL + (fiber.time() + opts.delay) * 1000000},
+        })
+    else
+        task = self.space:update(id, {
+            {'=', i_status, state.READY},
+            {'=', i_next_event, task[i_ttl]},
+        })
+    end
+    self:on_task_change(task, 'release')
+
+    return self:normalize_task(task)
 end
 
 -- peek task
 function tube.peek(self, id)
-    local task = self.raw:peek(id)
+    local task = self.space:get{id}
     if task == nil then
         box.error(box.error.PROC_LUA, string.format("Task %s not found", tostring(id)))
     end
 
-    return self.raw:normalize_task(task)
+    return self:normalize_task(task)
 end
 
 -- delete task
 function tube.delete(self, id)
     self:peek(id)
-    return self.raw:normalize_task(self.raw:delete(id):transform(2, 1, state.DONE))
+
+    local task = self.space:delete(id)
+    if task ~= nil then
+        task = task:transform(2, 1, state.DONE)
+    end
+    self:on_task_change(task, 'delete')
+
+    return self:normalize_task(task)
 end
 
 -- drop tube
@@ -144,10 +225,59 @@ function tube.drop(self)
     return true
 end
 
+-- watch fiber
+function tube._fiber(self)
+    local estimated, now, task
+
+    fiber.name('deque')
+    log.info("Started deque fiber")
+
+    while true do
+        estimated = TIMEOUT_INFINITY
+        now = 0ULL + fiber.time() * 1000000
+
+        -- delayed tasks
+        task = self.space.index.watch:min{state.DELAYED}
+        if task ~= nil and task[i_status] == state.DELAYED then
+            if now >= task[i_next_event] then
+                task = self.space:update(task[i_id], {
+                    {'=', i_status, state.READY},
+                    {'=', i_next_event, task[i_ttl]}
+                })
+                self:on_task_change(task)
+                estimated = 0
+            else
+                local et = tonumber(task[i_next_event] - now) / 1000000
+                if et < estimated then
+                    estimated = et
+                end
+            end
+        end
+
+        -- ttl tasks
+        task = self.space.index.watch:min{state.READY}
+        if task ~= nil and task[i_status] == state.READY then
+            if now >= task[i_ttl] then
+                self.space:delete(task[i_id])
+                self:on_task_change(task:transform(2, 1, state.DONE))
+                estimated = 0
+            else
+                local et = tonumber(task[i_next_event] - now) / 1000000
+                if et < estimated then
+                    estimated = et
+                end
+            end
+        end
+
+        if estimated > 0 then
+            task = nil  -- free refcounter
+            fiber.sleep(estimated)
+        end
+    end
+end
+
 
 -- methods
-local method = {}
-
 local function make_self(space, tube_name, tube_type, tube_id, opts)
     if opts == nil then
         opts = {}
@@ -191,13 +321,23 @@ local function make_self(space, tube_name, tube_type, tube_id, opts)
     end
 
     self = {
-        raw     = driver.new(space, on_task_change, opts),
         name    = tube_name,
         type    = tube_type,
         tube_id = tube_id,
+        space   = space,
         opts    = opts,
+        on_task_change = function(self, task, stats_data)
+            -- wakeup fiber
+            if task ~= nil and self.fiber ~= nil and self.fiber:id() ~= fiber.id() then
+                self.fiber:wakeup()
+            end
+            on_task_change(task, stats_data)
+        end
     }
     setmetatable(self, {__index = tube})
+
+    self.fiber = fiber.create(self._fiber, self)
+
     queue.tube[tube_name] = self
 
     return self
@@ -262,7 +402,12 @@ function method.create_tube(tube_name, opts)
     box.space._queue:insert{tube_name, tube_id, space_name, tube_type, opts}
 
     -- create tube space
-    local space = driver.create_space(space_name, opts)
+    -- 1        2       3           4    5,       6
+    -- task_id, status, next_event, ttl, created, data
+    local space = box.schema.create_space(space_name)
+    space:create_index('task_id', {type = 'tree', parts = {i_id, 'num'}})
+    space:create_index('status',  {type = 'tree', parts = {i_status, 'str', i_id, 'num'}})
+    space:create_index('watch',   {type = 'tree', parts = {i_status, 'str', i_next_event, 'num'}})
 
     return make_self(space, tube_name, tube_type, tube_id, opts)
 end
