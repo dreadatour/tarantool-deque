@@ -1,0 +1,8 @@
+# Hate OS X
+.DS_Store
+
+# Some editors files
+._*
+*.swp
+*.sublime-project
+*.sublime-workspace
