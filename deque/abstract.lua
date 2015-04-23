@@ -13,15 +13,15 @@ local state = {
     TAKEN   = 't',  -- task is taken by worker
     DONE    = '-',  -- task is done
 }
-local human_status = {}
-human_status[state.READY]   = 'ready'
-human_status[state.DELAYED] = 'delayed'
-human_status[state.TAKEN]   = 'taken'
-human_status[state.DONE]    = 'done'
+local human_state = {}
+human_state[state.DELAYED] = 'delayed'
+human_state[state.READY]   = 'ready'
+human_state[state.TAKEN]   = 'taken'
+human_state[state.DONE]    = 'done'
 
 -- space schema
 local i_id         = 1  -- task ID
-local i_status     = 2  -- task status
+local i_state     = 2  -- task state
 local i_next_event = 3  -- time of next event to be done on this task
 local i_ttl        = 4  -- time to live
 local i_created    = 5  -- creation time
@@ -38,9 +38,13 @@ local method = {}
 
 -- cleanup internal fields in task
 function tube.normalize_task(self, task)
-    if task ~= nil then
-        return task:transform(3, 3)
+    if task == nil then
+        return
     end
+
+    -- remove 'next_event', 'ttl' and 'created' fields
+    -- leave only 'id', 'state' and 'data'
+    return task:transform(3, 3)
 end
 
 -- put task in space
@@ -49,28 +53,27 @@ function tube.put(self, data, opts)
         opts = {}
     end
 
+    local ttl = opts.ttl or TIMEOUT_INFINITY
+    local now = fiber.time()
+    local valid_until = 0ULL + (now + ttl) * 1000000
+    local state = state.READY
+    local next_event = valid_until
+
+    -- TODO: check if delay > ttl
+    if opts.delay ~= nil and opts.delay > 0 then
+        state = state.DELAYED
+        next_event = 0ULL + (now + opts.delay) * 1000000
+    end
+
     local id = 0
     local max = self.space.index.task_id:max()
     if max ~= nil then
         id = max[i_id] + 1
     end
 
-    local ttl = opts.ttl or TIMEOUT_INFINITY
-
-    local now = fiber.time()
-    local valid_until = 0ULL + (now + ttl) * 1000000
-    local status = state.READY
-    local next_event = valid_until
-
-    -- TODO: check if delay > ttl
-    if opts.delay ~= nil and opts.delay > 0 then
-        status = state.DELAYED
-        next_event = 0ULL + (now + opts.delay) * 1000000
-    end
-
     local task = self.space:insert{
         id,
-        status,
+        state,
         next_event,
         valid_until,
         now,
@@ -89,10 +92,10 @@ function tube.take(self, timeout)
     end
 
     -- FIXME: duplicate code below
-    local task = self.space.index.status:min{state.READY}
-    if task ~= nil and task[i_status] == state.READY then
+    local task = self.space.index.state:min{state.READY}
+    if task ~= nil and task[i_state] == state.READY then
         task = self.space:update(task[i_id], {
-            {'=', i_status, state.TAKEN},
+            {'=', i_state, state.TAKEN},
             {'=', i_next_event, task[i_ttl]}
         })
         self:on_task_change(task, 'take')
@@ -110,10 +113,10 @@ function tube.take(self, timeout)
         box.space._queue_consumers:delete{session.id(), fiber.id()}
 
         -- FIXME: duplicate code above
-        local task = self.space.index.status:min{state.READY}
-        if task ~= nil and task[i_status] == state.READY then
+        task = self.space.index.state:min{state.READY}
+        if task ~= nil and task[i_state] == state.READY then
             task = self.space:update(task[i_id], {
-                {'=', i_status, state.TAKEN},
+                {'=', i_state, state.TAKEN},
                 {'=', i_next_event, task[i_ttl]}
             })
             self:on_task_change(task, 'take')
@@ -157,12 +160,12 @@ function tube.release(self, id, opts)
 
     if opts.delay ~= nil and opts.delay > 0 then
         task = self.space:update(id, {
-            {'=', i_status, state.DELAYED},
+            {'=', i_state, state.DELAYED},
             {'=', i_next_event, 0ULL + (fiber.time() + opts.delay) * 1000000},
         })
     else
         task = self.space:update(id, {
-            {'=', i_status, state.READY},
+            {'=', i_state, state.READY},
             {'=', i_next_event, task[i_ttl]},
         })
     end
@@ -204,7 +207,6 @@ function tube.drop(self)
     end
 
     local tube_id = tube[2]
-
     local cons = box.space._queue_consumers.index.consumer:min{tube_id}
 
     if cons ~= nil and cons[3] == tube_id then
@@ -238,10 +240,10 @@ function tube._fiber(self)
 
         -- delayed tasks
         task = self.space.index.watch:min{state.DELAYED}
-        if task ~= nil and task[i_status] == state.DELAYED then
+        if task ~= nil and task[i_state] == state.DELAYED then
             if now >= task[i_next_event] then
                 task = self.space:update(task[i_id], {
-                    {'=', i_status, state.READY},
+                    {'=', i_state, state.READY},
                     {'=', i_next_event, task[i_ttl]}
                 })
                 self:on_task_change(task)
@@ -256,7 +258,7 @@ function tube._fiber(self)
 
         -- ttl tasks
         task = self.space.index.watch:min{state.READY}
-        if task ~= nil and task[i_status] == state.READY then
+        if task ~= nil and task[i_state] == state.READY then
             if now >= task[i_ttl] then
                 self.space:delete(task[i_id])
                 self:on_task_change(task:transform(2, 1, state.DONE))
@@ -402,12 +404,12 @@ function method.create_tube(tube_name, opts)
     box.space._queue:insert{tube_name, tube_id, space_name, tube_type, opts}
 
     -- create tube space
-    -- 1        2       3           4    5,       6
-    -- task_id, status, next_event, ttl, created, data
+    -- 1        2      3           4    5,       6
+    -- task_id, state, next_event, ttl, created, data
     local space = box.schema.create_space(space_name)
     space:create_index('task_id', {type = 'tree', parts = {i_id, 'num'}})
-    space:create_index('status',  {type = 'tree', parts = {i_status, 'str', i_id, 'num'}})
-    space:create_index('watch',   {type = 'tree', parts = {i_status, 'str', i_next_event, 'num'}})
+    space:create_index('state',   {type = 'tree', parts = {i_state, 'str', i_id, 'num'}})
+    space:create_index('watch',   {type = 'tree', parts = {i_state, 'str', i_next_event, 'num'}})
 
     return make_self(space, tube_name, tube_type, tube_id, opts)
 end
@@ -439,11 +441,11 @@ function method.start()
     end
 
     for _, tube_rc in _queue:pairs() do
-        local tube_name     = tube_rc[1]
-        local tube_id       = tube_rc[2]
-        local tube_space    = tube_rc[3]
-        local tube_type     = tube_rc[4]
-        local tube_opts     = tube_rc[5]
+        local tube_name  = tube_rc[1]
+        local tube_id    = tube_rc[2]
+        local tube_space = tube_rc[3]
+        local tube_type  = tube_rc[4]
+        local tube_opts  = tube_rc[5]
 
         local space = box.space[tube_space]
         if space == nil then
@@ -491,7 +493,7 @@ local function put_statistics(stat, space, tube)
     -- add tasks by state count
     for i, s in pairs(state) do
         local s_table = {}
-        s_table[human_status[s]] = box.space[space].index[idx_tube]:count(s)
+        s_table[human_state[s]] = box.space[space].index[idx_tube]:count(s)
         table.insert(space_stat[space]['tasks'], s_table)
     end
     table.insert(stat, space_stat)
